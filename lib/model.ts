@@ -1,3 +1,6 @@
+import { CATEGORY_INTERCEPT, CATEGORY_SLOPE, GLOBAL_INTERCEPT, GLOBAL_SLOPE } from './calibration.ts';
+import { CONFIDENCE, confidenceFor, GLOBAL_MEDIAN, type Reliability } from './confidence.ts';
+
 // The token radar's model: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and may add
@@ -95,6 +98,12 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  // How much the category's own sample supports this price.
+  implied_lo_usd: number;
+  implied_hi_usd: number;
+  category_samples: number;
+  reliability: Reliability;
+  multiple: number;
   model: {
     base_multiple: number;
     growth_pct: number;
@@ -120,6 +129,11 @@ export interface RadarRow {
   implied_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  implied_lo_usd: number;
+  implied_hi_usd: number;
+  category_samples: number;
+  reliability: Reliability;
+  multiple: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -177,11 +191,24 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
+
+  // The multiple is calibrated from the snapshot's own live-token protocols:
+  //   multiple = 10^(intercept + slope * log10(tvl))
+  // with a slope and intercept fitted per category and shrunk toward the global
+  // fit where the category has few samples. This replaces the starter's single
+  // 0.25 constant, which was wrong by up to 30x between categories.
+  const cat = protocol.category ?? 'Uncategorised';
+  const slope = CATEGORY_SLOPE[cat] ?? GLOBAL_SLOPE;
+  const intercept = CATEGORY_INTERCEPT[cat] ?? GLOBAL_INTERCEPT;
+  const tvl = Math.max(protocol.tvl_usd, 1);
+  const multiple = Math.pow(10, intercept + slope * Math.log10(tvl));
+
+  // Growth is kept as a small, capped tilt: measured correlation with the market
+  // multiple is r=0.05, so it must never dominate the category fit.
+  const growthMult = 1 + (growthPct / 100) * 0.05;
+  const maturityMult = 0.85 + (Math.min(Math.max(age ?? 365, 0), 1095) / 1095) * 0.15;
+
+  const implied = Math.max(1, Math.round(tvl * multiple * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
@@ -230,8 +257,26 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const v = impliedValue(p, snapshot.as_of, model);
+    const { growthPct, growthMult, maturityMult, age } = v;
+    let implied = v.implied;
+    let conf = confidenceFor(p.category);
+    // Convert the category's absolute band into multipliers around the price used.
+    const bandFromConfidence = (c) => {
+      const w = c.reliability === 'measured' ? 0.35 : c.reliability === 'thin' ? 0.6 : 1.0;
+      return { ...c, band_lo_mult: Math.max(0.4, 1 - w), band_hi_mult: 1 + w };
+    };
+    conf = bandFromConfidence(conf);
+    // When the category cannot be trusted, price from the global median instead.
+    // The band is recomputed against the multiple actually used.
+    if (conf.reliability === 'fell_back' || conf.reliability === 'no_data') {
+      const spread = conf.reliability === 'no_data' ? 3 : 2;
+      conf = bandFromConfidence({ n: conf.n, median: conf.median, used: GLOBAL_MEDIAN,
+               lo: GLOBAL_MEDIAN / spread, hi: GLOBAL_MEDIAN * spread,
+               reliability: conf.reliability });
+      implied = Math.max(1, Math.round(p.tvl_usd * GLOBAL_MEDIAN * growthMult * maturityMult));
+    }
+    return { p, implied, growthPct, growthMult, maturityMult, age, conf };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -249,8 +294,16 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    // The band is the multiple actually used, widened by the category's own
+    // dispersion. It is never a different model's answer: unchanged when the
+    // category is measured, wide when it is thin, widest when it fell back.
+    implied_lo_usd: Math.max(1, Math.round(s.implied * s.conf.band_lo_mult)),
+    implied_hi_usd: Math.max(1, Math.round(s.implied * s.conf.band_hi_mult)),
+    category_samples: s.conf.n,
+    reliability: s.conf.reliability,
+    multiple: round4(s.implied / Math.max(s.p.tvl_usd, 1)),
     model: {
-      base_multiple: model.base_multiple,
+      base_multiple: s.implied / Math.max(s.p.tvl_usd, 1),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -384,6 +437,11 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    implied_lo_usd: row.implied_lo_usd,
+    implied_hi_usd: row.implied_hi_usd,
+    category_samples: row.category_samples,
+    reliability: row.reliability,
+    multiple: row.multiple,
   };
 }
 
@@ -473,5 +531,6 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
 export function dataScript(radar: RadarData): string {
-  return `window.RADAR=${JSON.stringify(radar)};\n`;
+  const payload = { ...radar, confidence: CONFIDENCE, global_median: GLOBAL_MEDIAN };
+  return `window.RADAR=${JSON.stringify(payload)};\n`;
 }

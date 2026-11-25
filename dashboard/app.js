@@ -21,6 +21,30 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
   }
+  var RELIABILITY_LABEL = {
+    measured: 'measured',
+    thin: 'thin sample',
+    fell_back: 'no category sample',
+    no_data: 'no category sample'
+  };
+  var RELIABILITY_TITLE = {
+    measured: 'This category has enough live tokens in the snapshot to price it on its own record.',
+    thin: 'This category has few live tokens, so the multiple is pulled part of the way to the all-category median. The band is wide on purpose.',
+    fell_back: 'This category has fewer than three live tokens, which cannot support a price. The row uses the all-category median instead, and says so.',
+    no_data: 'No live token in this category exists in the snapshot. The row uses the all-category median.'
+  };
+  function reliabilityBadge(row) {
+    var key = row.reliability || 'no_data';
+    return el('span', {
+      class: 'reliab reliab-' + key,
+      title: RELIABILITY_TITLE[key] || '',
+      text: RELIABILITY_LABEL[key] || key
+    });
+  }
+  function fmtBand(row) {
+    if (!row.implied_lo_usd || !row.implied_hi_usd) return '';
+    return fmtUsd(row.implied_lo_usd) + ' - ' + fmtUsd(row.implied_hi_usd);
+  }
   function fmtAge(days) {
     if (days === null || days === undefined) return 'unknown';
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
@@ -28,12 +52,22 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * model.base_multiple * growthMult * maturity));
+  // The page recomputes the row exactly as lib/model.ts does: the calibrated
+  // category multiple, the small growth tilt and the maturity tilt. It never
+  // re-derives with a constant the model no longer uses.
+  function impliedOf(row) {
+    var conf = (window.RADAR_CONFIDENCE || {})[row.category || 'Uncategorised'];
+    var multiple;
+    if (conf && conf.used) multiple = conf.used;
+    else multiple = window.RADAR_GLOBAL_MEDIAN || 0.2632;
+    // The board's own multiple is authoritative when it names one.
+    if (row.multiple !== undefined && row.multiple !== null) multiple = row.multiple;
+    var growth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    growth = Math.min(120, Math.max(-60, growth));
+    var growthMult = 1 + (growth / 100) * 0.05;
+    var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
+    var maturity = 0.85 + (Math.min(Math.max(age, 0), 1095) / 1095) * 0.15;
+    return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity));
   }
 
   function el(tag, attrs) {
@@ -232,10 +266,13 @@
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', null, el('div', { class: 'implied' },
-          el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
+          el('div', { class: 'imp-row' },
+            el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
+            el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
+          ),
+          el('span', { class: 'band', text: fmtBand(r) })
         )),
-        el('td', null, el('span', { class: 'status', text: 'no token' }))
+        el('td', null, reliabilityBadge(r))
       );
       tbody.appendChild(tr);
     });
@@ -250,7 +287,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
-            el('th', { scope: 'col', text: 'Token' })
+            el('th', { scope: 'col', text: 'Confidence' })
           )),
           tbody
         )
@@ -283,18 +320,61 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var counts = { measured: 0, thin: 0, fell_back: 0, no_data: 0 };
+    DATA.rows.forEach(function (r) {
+      var k = r.reliability || 'no_data';
+      if (counts[k] === undefined) counts[k] = 0;
+      counts[k] += 1;
+    });
+
+    // One row per category present on the board, strongest sample first.
+    var byCat = {};
+    DATA.rows.forEach(function (r) {
+      var c = r.category || 'Uncategorised';
+      if (!byCat[c]) byCat[c] = { name: c, n: r.category_samples || 0, rel: r.reliability, rows: 0 };
+      byCat[c].rows += 1;
+    });
+    var cats = Object.keys(byCat).map(function (k) { return byCat[k]; })
+      .sort(function (a, b) { return b.n - a.n || a.name.localeCompare(b.name); });
+
+    var REL_ORDER = { measured: 0, thin: 1, fell_back: 2, no_data: 3 };
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'No protocol name is special-cased and no row is hand-picked. The multiple for a category is measured from the live-token protocols in this same snapshot, then shrunk toward the all-category median by how many samples the category has.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ' + m.base_multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'multiple = 10^(intercept + slope x log10(tvl_usd))      implied = round( tvl_usd x multiple x growth_tilt x maturity )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: 'The slope and intercept are fitted per category on the snapshot\'s own live tokens; the growth tilt is capped at +/-5% because the measured correlation between seven-day growth and the market multiple is r=0.05, close to nothing. Maturity tilts 15% across the first three years a protocol has run without a token.' }),
+
+      el('h3', { text: 'How far each row can be trusted' }),
+      el('p', { class: 'sub', text: 'A category with fewer than three live tokens in the snapshot cannot support a price of its own. Those rows use the all-category median and say so, rather than extrapolating from one or two examples.' }),
+      el('div', { class: 'rel-summary' },
+        el('span', { class: 'reliab reliab-measured', text: counts.measured + ' rows measured' }),
+        el('span', { class: 'reliab reliab-thin', text: counts.thin + ' rows thin' }),
+        el('span', { class: 'reliab reliab-fell_back', text: counts.fell_back + ' rows fell back' }),
+        el('span', { class: 'reliab reliab-no_data', text: counts.no_data + ' rows no data' })
+      ),
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'cats' },
+          el('caption', { class: 'sub', text: 'Every category on the board, by how many live-token samples it has.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Category' }),
+            el('th', { scope: 'col', text: 'Live samples' }),
+            el('th', { scope: 'col', text: 'Rows on board' }),
+            el('th', { scope: 'col', text: 'Priced from' })
+          )),
+          el('tbody', null, cats.map(function (c) {
+            return el('tr', null,
+              el('td', { text: c.name }),
+              el('td', { class: 'num', text: String(c.n) }),
+              el('td', { class: 'num', text: String(c.rows) }),
+              el('td', null, reliabilityBadge({ reliability: c.rel }))
+            );
+          }))
+        )
+      )
     );
   }
-
-  var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
-  dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
 
   function openDetail(slug) {
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
@@ -321,7 +401,7 @@
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': one function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row)) + ', within rounding of the ' + fmtUsd(row.implied_value_usd) + ' board.json carries. This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),

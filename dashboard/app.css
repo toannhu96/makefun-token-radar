@@ -137,3 +137,52 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* Confidence badges: how far a row's price can be trusted. */
+.reliab {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: help;
+}
+.reliab-measured  { background: #d8f0dc; color: #1c5f2a; border: 1px solid #a9d8b3; }
+.reliab-thin      { background: #fdf0d5; color: #7a5406; border: 1px solid #e8cf94; }
+.reliab-fell_back { background: #f7e0dc; color: #8a2c1c; border: 1px solid #e0b8ae; }
+.reliab-no_data   { background: #e6e6e6; color: #4a4a4a; border: 1px solid #c9c9c9; }
+.implied .num { display: block; }
+.implied .band {
+  display: block;
+  font-size: 11px;
+  color: #7a7670;
+  margin-top: 1px;
+  white-space: nowrap;
+}
+.rel-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+table.cats caption { text-align: left; padding-bottom: 6px; }
+
+/* The implied cell is a grid so the figure and its band always stack. */
+.implied {
+  display: grid;
+  grid-auto-flow: row;
+  gap: 1px;
+}
+.implied .num,
+.implied .band {
+  display: block;
+  white-space: nowrap;
+}
+
+.implied .imp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
